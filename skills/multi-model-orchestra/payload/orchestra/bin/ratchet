@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# ratchet —— 欠账棘轮：已有的违规记成欠账，只许减少；新代码一处也不许有。
+#
+# 对应文章：「加检查时，已有的违规记成欠账，只许减少，新代码一处也不许有。」
+# 检查命令每行打印一条违规，写成【稳定 id】（如 路径:规则名:符号，不要带行号，否则改一行就算新违规）。
+#
+#   ratchet init   <名字> -- <检查命令…>      首次建立欠账基线（基线文件要提交进仓库）
+#   ratchet check  <名字> [--strict] -- <检查命令…>   有新违规 → 退出 1；--strict 下欠账还清了没收紧也退出 1（CI 用）
+#   ratchet update <名字> -- <检查命令…>      收紧基线；有新违规时拒绝（只许减少）
+#   ratchet status <名字>                     看基线有几条
+set -uo pipefail
+# shellcheck source=/dev/null
+. "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
+
+usage() { sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+SUB=${1:-}; NAME=${2:-}
+case "$SUB" in init|check|update|status) ;; -h|--help|"") usage; exit 0 ;; *) usage >&2; exit 2 ;; esac
+[ -n "$NAME" ] || { echo "缺少 <名字>" >&2; exit 2; }
+shift 2
+STRICT=0
+[ "${1:-}" = "--strict" ] && { STRICT=1; shift; }
+[ "${1:-}" = "--" ] && shift
+
+top=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+DIR=${ORCH_RATCHET_DIR:-$top/.orchestra/ratchet}
+BASEFILE=$DIR/$NAME.baseline
+
+if [ "$SUB" = status ]; then
+  [ -f "$BASEFILE" ] || { echo "没有基线：$BASEFILE"; exit 3; }
+  echo "$NAME：欠账 $(grep -c . "$BASEFILE" || true) 条（$BASEFILE）"; exit 0
+fi
+
+[ $# -ge 1 ] || { echo "缺少检查命令（-- 之后）" >&2; exit 2; }
+# 检查命令的契约：违规一行一条打印到 stdout；退出码不当违规数用。但下面几种一律当作「检查器自己出错」——
+# 退出 4、不判定、不改基线（否则一个坏掉的检查器会被当成零违规，update 还会把欠账清空：最典型的假绿灯）：
+#   · 退出码 ≥124（超时 / 无法执行 / 被信号杀）
+#   · 退出码非 0 且 stderr 有内容（检查器报了错；就算它还输出了一部分结果，也不当成完整结果——
+#     比如 grep 一个文件不存在，另一个文件的匹配照样会打出来。要忽略 stderr 请显式写 2>/dev/null，由你负责）
+#   · stdout 没有任何输出，且退出码 ≥2（grep 的语法错误就是 2）
+# 正常的：退出 0（stderr 里有警告也行）；退出 1 且 stdout/stderr 都空（grep 没匹配）；stderr 干净、有违规输出时退出码随意（tsc 用 2）。
+# stderr 经 scrub_log 流式擦掉时间戳再落盘：检查器被强杀（SIGKILL，trap 来不及清理）时，TMPDIR 里也不会留下带时间戳的原始诊断。
+OUTF=""; ERRF=""
+trap '[ -z "$OUTF$ERRF" ] || rm -f "$OUTF" "$ERRF"' EXIT INT TERM HUP
+run_checker() {
+  local out rc err why="" empty=0
+  OUTF=$(mktemp) && ERRF=$(mktemp) || { echo "无法创建临时文件" >&2; exit 4; }
+  # 单个字符串当 shell 命令跑，并开 pipefail：管道末端的 sort/head 掩盖不了前面命令（grep 之类）的错误
+  if [ $# -eq 1 ]; then run_scrubbed /dev/null "$OUTF" "$ERRF" 0 -- bash -o pipefail -c "$1"; else run_scrubbed /dev/null "$OUTF" "$ERRF" 0 -- "$@"; fi
+  rc=$?
+  out=$(cat "$OUTF"); err=$(tail -c 1500 "$ERRF" | sed 's/\r$//'); rm -f "$OUTF" "$ERRF"; OUTF=""; ERRF=""
+  [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ] && empty=1
+  if [ $rc -ge 124 ]; then why="退出码 $rc（超时 / 无法执行 / 被信号终止）"
+  elif [ $rc -ne 0 ] && [ -n "$err" ]; then why="退出码 $rc 且 stderr 有内容（检查器报了错，已输出的部分不能当完整结果）"
+  elif [ $empty -eq 1 ] && [ $rc -ge 2 ]; then why="退出码 $rc 且没有任何输出"
+  fi
+  if [ -n "$why" ]; then
+    echo "⛔ 检查命令自己出错了（$why）：本次不判定、不改基线。" >&2
+    [ -n "$err" ] && printf '%s\n' "$err" | tail -5 | sed 's/^/   stderr: /' >&2
+    echo "   契约：检查命令把违规一行一条打印到 stdout；退出码非 0 时 stderr 必须为空（要忽略它请显式 2>/dev/null）。" >&2
+    exit 4
+  fi
+  # 不去重：同一个 id 出现几次就算几条（同一函数里同一规则违规两次，是两条）
+  CUR=$(printf '%s\n' "$out" | sed 's/\r$//' | grep -v '^[[:space:]]*$' | LC_ALL=C sort)
+}
+run_checker "$@"
+
+BASE_TXT=""
+[ -f "$BASEFILE" ] && BASE_TXT=$(LC_ALL=C sort "$BASEFILE" | grep -v '^[[:space:]]*$' || true)
+NEW=$(LC_ALL=C comm -13 <(printf '%s\n' "$BASE_TXT" | grep . || true) <(printf '%s\n' "$CUR" | grep . || true))
+PAID=$(LC_ALL=C comm -23 <(printf '%s\n' "$BASE_TXT" | grep . || true) <(printf '%s\n' "$CUR" | grep . || true))
+count() { printf '%s\n' "$1" | grep -c . || true; }
+
+case "$SUB" in
+  init)
+    [ -f "$BASEFILE" ] && { echo "基线已存在：$BASEFILE（要收紧用 update）" >&2; exit 2; }
+    mkdir -p "$DIR"; printf '%s\n' "$CUR" | grep . > "$BASEFILE" || : > "$BASEFILE"
+    echo "已建立基线：$NAME，欠账 $(count "$CUR") 条。把 $BASEFILE 提交进仓库；此后只许减少。" ;;
+  check)
+    [ -f "$BASEFILE" ] || { echo "$NAME：还没有基线，先 ratchet init" >&2; exit 3; }
+    if [ -n "$NEW" ]; then
+      echo "⛔ $NAME：出现 $(count "$NEW") 条【新】违规（新代码一处也不许有）："
+      printf '%s\n' "$NEW" | sed 's/^/   + /'
+      exit 1
+    fi
+    if [ -n "$PAID" ]; then
+      echo "✓ $NAME：无新违规；欠账已还清 $(count "$PAID") 条（剩 $(count "$CUR") 条）→ 运行 ratchet update $NAME -- … 收紧基线并提交"
+      [ "$STRICT" -eq 1 ] && { echo "（--strict：基线没收紧，视为失败，防止欠账日后悄悄涨回去）" >&2; exit 1; }
+      exit 0
+    fi
+    echo "✓ $NAME：无新违规，欠账 $(count "$CUR") 条（未变）" ;;
+  update)
+    [ -f "$BASEFILE" ] || { echo "$NAME：还没有基线，先 ratchet init" >&2; exit 3; }
+    if [ -n "$NEW" ]; then
+      echo "⛔ 拒绝 update：有 $(count "$NEW") 条新违规，基线只许减少、不许借 update 把新违规洗成欠账：" >&2
+      printf '%s\n' "$NEW" | sed 's/^/   + /' >&2
+      exit 1
+    fi
+    printf '%s\n' "$CUR" | grep . > "$BASEFILE" || : > "$BASEFILE"
+    echo "✓ 基线已收紧：$NAME 欠账 $(count "$CUR") 条（还清 $(count "$PAID") 条）。记得提交。" ;;
+esac

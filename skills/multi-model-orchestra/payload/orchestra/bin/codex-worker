@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# codex-worker —— 把独立模块 / 浏览器操控派给本机 Codex。
+#
+# 对应文章里自定义的 codex-worker：固定档位、不直接调 codex exec（它默认完全访问）。
+# 边界：沙箱 workspace-write（只能写工作树）、无网络、approval=never；不装依赖、不联网测试、不提交推送——这些由总指挥做。
+# 用法：
+#   codex-worker [选项] <工作树> "<任务>"
+#   codex-worker --resume <会话ID> [选项] <工作树> "<追加>"
+set -uo pipefail
+# shellcheck source=/dev/null
+. "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+用法：
+  codex-worker [选项] <工作树> "<任务>"            任务写 - 表示从标准输入读（长任务书用 heredoc）
+  codex-worker --resume <会话ID> [选项] <工作树> "<追加>"   在同一个 Codex 会话里追加要求
+  codex-worker --doctor                           体检：codex 在不在、版本、档位
+选项：
+  --browser        浏览器/网页操控档（模型与推理档取 CODEX_BROWSER_*）
+  --model <id>  --effort <low|medium|high|xhigh|max>
+  --allow-main     允许对主工作区动手（默认拒绝：请给 Codex 单独的 git worktree，别和你同时改一份）
+  --print-prompt   只打印最终提示词（工作约束 + 脱敏后的任务书），不调用；T3 delegate_task 路径用它
+退出码：0 成功 | 2 用法错 | 4 前置条件不满足 | 5 Codex 失败或不可用 | 6 Codex 违规提交了代码
+放后台跑（run_in_background）。交回后：读 diff、自己跑测试；装依赖/联网测试/提交推送由你做。
+EOF
+}
+
+doctor() {
+  need_cmd codex "装 Codex CLI（npm i -g @openai/codex）"
+  echo "✓ codex：$(command -v codex)  $(codex --version 2>&1 | head -1)"
+  echo "  干活档：$CODEX_WORKER_MODEL / $CODEX_WORKER_EFFORT   浏览器档：$CODEX_BROWSER_MODEL / $CODEX_BROWSER_EFFORT"
+  codex exec --help 2>&1 | grep -q -- '--output-schema' && echo "✓ 支持 --output-schema（审查门用）" || echo "✗ 这个 codex 版本没有 --output-schema，审查门不能用"
+  echo "  沙箱：每次显式指定 workspace-write + approval=never + 无网络，不依赖你 config.toml 的默认值"
+}
+
+RESUME=""; BROWSER=0; ALLOW_MAIN=0; PRINT=0; DO_DOCTOR=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --resume) RESUME=${2:?--resume 需要会话ID}; shift 2 ;;
+    --browser) BROWSER=1; shift ;;
+    --model) OPT_MODEL=${2:?}; shift 2 ;;
+    --effort) OPT_EFFORT=${2:?}; shift 2 ;;
+    --allow-main) ALLOW_MAIN=1; shift ;;
+    --print-prompt) PRINT=1; shift ;;
+    --doctor) DO_DOCTOR=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) echo "未知参数：$1" >&2; usage >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+[ "$DO_DOCTOR" -eq 1 ] && { doctor; exit $?; }
+
+[ $# -ge 2 ] || { usage >&2; exit 2; }
+WT=$1; TASK=$2
+[ "$TASK" = "-" ] && TASK=$(cat)
+[ -n "$TASK" ] || { DIE_CODE=2; die "任务为空"; }
+
+if [ "$BROWSER" -eq 1 ]; then MODEL=$CODEX_BROWSER_MODEL; EFFORT=$CODEX_BROWSER_EFFORT; else MODEL=$CODEX_WORKER_MODEL; EFFORT=$CODEX_WORKER_EFFORT; fi
+MODEL=${OPT_MODEL:-$MODEL}; EFFORT=${OPT_EFFORT:-$EFFORT}
+
+# 提示词：新任务 = 工作约束 + 任务书；追加 = 只发追加内容（会话里已有约束）
+if [ -n "$RESUME" ]; then
+  BODY=$(printf '## 追加要求\n\n%s\n' "$TASK")
+else
+  BODY=$(printf '%s\n\n---\n\n## 任务书\n\n%s\n' "$(cat "$ORCH_HOME/prompts/codex-worker.md")" "$TASK")
+fi
+PROMPT=$(printf '%s' "$BODY" | redact code)
+if [ "$PRINT" -eq 1 ]; then printf '%s\n' "$PROMPT"; exit 0; fi
+
+need_cmd codex "装 Codex CLI（npm i -g @openai/codex）；可先跑 --doctor"
+need_cmd node "Codex 本身依赖 Node"
+[ -d "$WT" ] || { DIE_CODE=4; die "工作树不存在：$WT"; }
+# 先用 bash 内建的 cd 进去（POSIX / 混合 / 相对路径都认），之后的 git 命令不再带路径参数——
+# 原生 git.exe 看不懂 /d/xxx 这类 POSIX 路径（本套件为避免参数被乱改，关掉了 MSYS 的自动转换）。
+cd "$WT" || { DIE_CODE=4; die "进不去目录：$WT"; }
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { DIE_CODE=4; die "不是 git 工作树：$WT"; }
+TOP=$(git rev-parse --show-toplevel)
+GITDIR=$(git rev-parse --absolute-git-dir)
+COMMON=$(git rev-parse --path-format=absolute --git-common-dir)
+if [ "$GITDIR" = "$COMMON" ] && [ "$ALLOW_MAIN" -ne 1 ]; then
+  DIE_CODE=4
+  die "$WT 是主工作区。请给 Codex 单独的 worktree：git worktree add ../wt-<任务名> -b codex/<任务名>；确需在主工作区干就加 --allow-main"
+fi
+cd "$TOP" || exit 4
+
+RUN=$(mk_run_dir codex)
+printf '%s\n' "$PROMPT" > "$RUN/prompt.md"
+HEAD0=$(git rev-parse HEAD 2>/dev/null || echo none)
+
+# 注意：`codex exec resume` 比 `codex exec` 少一批参数（没有 --color / -C / -s），实测会直接报错——
+# 所以新任务和追加用两套参数；沙箱、审批、无网络统一走 -c 覆盖，两条路径都认。
+COMMON_ARGS=(-m "$MODEL" -c "model_reasoning_effort=\"$EFFORT\"" -c 'sandbox_mode="workspace-write"' -c 'approval_policy="never"'
+             -c 'sandbox_workspace_write.network_access=false' --json -o "$(to_native "$RUN/last.md")")
+if [ -n "$RESUME" ]; then
+  # resume 没有 -C：靠上面的 cd "$TOP" 让进程工作目录就是工作树
+  run_scrubbed "$RUN/prompt.md" "$RUN/events.jsonl" "$RUN/stderr.log" 1 -- timeout "$CODEX_TIMEOUT_SECS" codex exec resume "$RESUME" "${COMMON_ARGS[@]}" -
+else
+  run_scrubbed "$RUN/prompt.md" "$RUN/events.jsonl" "$RUN/stderr.log" 1 -- timeout "$CODEX_TIMEOUT_SECS" codex exec "${COMMON_ARGS[@]}" --color never -C "$(to_native "$TOP")" -
+fi
+RC=$?
+
+SID=$(sed -n 's/.*"thread_id":"\([^"]*\)".*/\1/p' "$RUN/events.jsonl" | head -1)
+[ -n "$SID" ] || SID=$RESUME
+# 违规提交要先于「成功/失败」判断：Codex 提交之后再报错退出，提交照样留在工作树里
+HEAD1=$(git rev-parse HEAD 2>/dev/null || echo none)
+VIOL=0; [ "$HEAD0" != "$HEAD1" ] && VIOL=1
+if [ $RC -ne 0 ]; then
+  echo "codex-worker：Codex 失败或不可用（退出码 $RC）。stderr 末尾：" >&2
+  tail -8 "$RUN/stderr.log" >&2
+  echo "运行记录：$RUN   会话ID：${SID:-无}" >&2
+  if [ $VIOL -eq 1 ]; then
+    echo "⚠ 而且 Codex 在出错之前已经创建了提交（HEAD 变了）——违反「提交推送由总指挥做」。先 git log 看一眼再决定是否保留。" >&2
+    exit 6
+  fi
+  exit 5
+fi
+
+echo "== codex-worker 完成 =="
+echo "会话ID：$SID    追加：bash .orchestra/bin/codex-worker --resume $SID <工作树> \"…\""
+echo "档位：$MODEL / $EFFORT    沙箱：workspace-write（无网络，不许提交）"
+echo "运行记录：$RUN"
+echo "--- Codex 终稿 ---"
+cat "$RUN/last.md" 2>/dev/null || echo "（无终稿）"
+echo
+echo "--- 工作树变更 ---"
+STATUS=$(git status --short | head -40)
+printf '%s\n' "$STATUS"
+git diff --stat | tail -15
+printf '%s\n' "$STATUS" | grep -q '^??' && echo "（?? 开头的是新文件，git diff 看不到，请直接读文件）"
+if [ $VIOL -eq 1 ]; then
+  echo "⚠ Codex 创建了提交（HEAD 变了）——违反「提交推送由总指挥做」。先 git log 看一眼再决定是否保留。"
+  exit 6
+fi
+echo "→ 下一步（规则）：读 diff、自己跑测试、对照验收标准逐条核；装依赖/联网测试/提交推送由你做。"

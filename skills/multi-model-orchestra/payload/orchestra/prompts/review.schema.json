@@ -1,0 +1,52 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "previous_blockers", "blocking", "advisory"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["pass", "block"] },
+    "summary": { "type": "string" },
+    "previous_blockers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "note"],
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "type": "string", "enum": ["fixed", "not_fixed"] },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "blocking": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "class", "title", "file", "line", "how_it_happens", "fix_hint"],
+        "properties": {
+          "id": { "type": "string" },
+          "class": { "type": "string", "enum": ["money", "data_loss", "authz", "wrong_message", "release_incident"] },
+          "title": { "type": "string" },
+          "file": { "type": "string" },
+          "line": { "type": "integer" },
+          "how_it_happens": { "type": "string" },
+          "fix_hint": { "type": "string" }
+        }
+      }
+    },
+    "advisory": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "file", "note"],
+        "properties": {
+          "title": { "type": "string" },
+          "file": { "type": "string" },
+          "note": { "type": "string" }
+        }
+      }
+    }
+  }
+}

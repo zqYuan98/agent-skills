@@ -1,0 +1,33 @@
+# .orchestra/sensitive-paths —— 命中这些路径的改动，审查自动升到深档（CODEX_REVIEW_EFFORT_DEEP，默认 xhigh）。
+# 把本文件复制为 .orchestra/sensitive-paths 再按你的仓库改；没有这个文件时脚本用下面这套通用默认。
+# 一行一个通配符，大小写不敏感，`*` 可跨目录；# 开头是注释。
+#
+# 文章的四类：钱 / 权限和登录 / 对外发消息 / 往外部系统（飞书等）写数据。
+
+# 钱
+*pay*
+*billing*
+*invoice*
+*refund*
+*price*
+*wallet*
+*ledger*
+*settle*
+# 权限与登录
+*auth*
+*login*
+*permission*
+*rbac*
+*acl*
+*oauth*
+*credential*
+# 对外发消息
+*notify*
+*notification*
+*sms*
+*webhook*
+*mailer*
+# 往外部系统写数据
+*lark*
+*feishu*
+*bitable*

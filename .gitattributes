@@ -1,0 +1,2 @@
+# 统一用 LF：技能里的 .sh 被换成 CRLF，在 Git Bash / WSL / Linux 上会直接跑不起来
+* text=auto eol=lf

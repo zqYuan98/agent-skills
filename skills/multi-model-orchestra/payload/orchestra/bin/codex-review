@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# codex-review —— 合并前审查门（文章：每个合并请求上线前都要过一遍 GPT 审查，没过不进 CI）。
+#
+# 把文章里的「判断」写成「检查」：
+#   两级：只有（算错钱/丢数据/越权/发错消息/发布事故）且说得出怎么发生的才阻断，其余只记录；
+#   最多审两轮，两轮还有阻断项 → 停，交给用户决定（放行 / 再审一轮）；
+#   推理深度：常规 high；碰到钱、权限登录、对外发消息、写外部系统的文件用 xhigh（见 sensitive-paths）。
+set -uo pipefail
+# shellcheck source=/dev/null
+. "$(dirname "${BASH_SOURCE[0]}")/../lib/review.sh"
+
+usage() {
+  cat <<'EOF'
+用法：codex-review <子命令> [选项]
+  run                审一轮（调用 Codex，只读沙箱）：审 HEAD 相对基线的已提交改动
+  prompt             只生成本轮审查提示词并打印（不调用），并记下「审的是哪份内容」、发一个请求ID（stderr）；T3 路径用，配合 record
+  record <文件> --request <请求ID>
+                     把别处（T3 子任务等）交回的原始审查结论喂进来，走同一套判定与计数。
+                     必须先 prompt、带上它发的请求ID；且自 prompt 之后内容不能变——审的是 A，结论就不能记到 B 上
+  status             看当前这份改动的审查状态与审计（已通过/已放行 → 退出码 0，否则 1）
+  approve --by "…"   【用户的决定】放行：把当前改动记为已放行。--by 写决定人与原话，进审计记录
+  again   --by "…"   【用户的决定】再审一轮：给本分支多加 1 轮额度。--by 同上
+  publish            把审查凭证（git notes，挂在 tree 上，不带时间戳、身份中性、不带用户原话）推到 origin，让 CI 能核验：
+                     CI 里 `ORCH_BASE=origin/<目标分支> review-gate-check --ci`（脚本要取自目标分支的可信副本，见 docs/CI接入.md）。
+                     凭证在「通过」或「放行」时自动写入本地；推送要显式做。本机的通过记录有而凭证缺了（丢了/没写成），publish 会先补上
+选项：--base <分支>  --intent "<这次改动要做什么>" | --intent-file <文件>  --deep|--no-deep  --effort <档>  --model <id>
+基线分支：--base > ORCH_BASE > git config orchestra.base > origin/HEAD > origin|本地 的 main/master/trunk/develop
+退出码：0 通过 | 1 有阻断项（还有轮次，修完再 run） | 2 审满轮数仍有阻断项→必须交用户决定
+        3 审查结论无效（不计轮次，重跑） | 4 前置条件不满足 | 5 审查者不可用或失败
+approve / again 是用户的决定，不是你的：只有用户在对话里明确答复之后才能执行，--by 里写原话。
+EOF
+}
+
+SUB=${1:-}
+case "$SUB" in
+  run|prompt|record|status|approve|again|publish) shift ;;
+  -h|--help|"") usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+OPT_EFFORT=""; OPT_MODEL=""; DEEP_FLAG=auto; BY=""; RECORD_FILE=""; INTENT=""; BASE_OVERRIDE=""; REQ=""
+needv() { [ "$1" -ge 2 ] || { echo "$2 需要一个值" >&2; exit 2; }; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --request) needv $# "$1"; REQ=$2; shift 2 ;;
+    --base) needv $# "$1"; BASE_OVERRIDE=$2; shift 2 ;;
+    --intent) needv $# "$1"; INTENT=$2; shift 2 ;;
+    --intent-file) needv $# "$1"; INTENT=$(cat "$2"); shift 2 ;;
+    --effort) needv $# "$1"; OPT_EFFORT=$2; shift 2 ;;
+    --model) needv $# "$1"; OPT_MODEL=$2; shift 2 ;;
+    --deep) DEEP_FLAG=yes; shift ;;
+    --no-deep) DEEP_FLAG=no; shift ;;
+    --by) needv $# "$1"; BY=$2; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "未知参数：$1" >&2; usage >&2; exit 2 ;;
+    *) if [ "$SUB" = record ] && [ -z "$RECORD_FILE" ]; then RECORD_FILE=$1; shift; else echo "多余的参数：$1" >&2; exit 2; fi ;;
+  esac
+done
+
+escalate_msg() {
+  cat <<EOF
+
+⛔ 已审满 $ROUNDS_USED/$MAX_ALLOWED 轮仍有阻断项 —— 按规则交用户决定（放行 / 再审一轮 / 用户先自己看）。
+   你（总指挥）现在：向用户提问，把上面的阻断项摆给 TA，选项给：放行上线 / 再审一轮 / 我先看看。
+   用户答复之后才能执行（--by 里写用户原话）：
+     放行：bash .orchestra/bin/codex-review approve --by "<用户原话>"
+     再审：bash .orchestra/bin/codex-review again --by "<用户原话>"   （然后修完再 run）
+   不得自行放行；不得 git push --no-verify；不得设 ORCH_GATE=off。
+EOF
+}
+
+# 审满轮数且还没有通过/放行记录 → 不再调用审查者、也不再记账，交给用户决定（退出 2）。run / prompt / record 共用。
+exhausted_check() {
+  if [ ! -f "$OK_FILE" ] && [ "$ROUNDS_USED" -ge "$MAX_ALLOWED" ]; then
+    echo "本分支已审 $ROUNDS_USED/$MAX_ALLOWED 轮，不再调用审查者、也不再记账。"
+    [ -f "${LAST_FILE%.json}.md" ] && cat "${LAST_FILE%.json}.md"
+    escalate_msg; exit 2
+  fi
+}
+
+# ── 公共准备：run / prompt / record 共用，轮次上限与「同内容不重审」只在这一处 ──────────
+prepare() {
+  review_ctx_init
+  if [ "$SELF_BASE" = 1 ]; then
+    DIE_CODE=4
+    die "基线是猜出来的（$BASE），而这次相对它没有任何改动，没法比较——此时「没有改动」不可信（比如默认分支其实叫别的名字）。$BASE_HELP"
+  fi
+  if [ "$MB" = "$HEAD_SHA" ]; then echo "HEAD 与基线 $BASE 之间没有改动，无需审查。"; exit 0; fi
+  if [ -f "$OK_FILE" ]; then
+    echo "✓ 这份改动（树 ${TREE:0:10}）已有通过/放行记录，无需重审（省一次钱）。"; sed 's/^/  /' "$OK_FILE"; exit 0
+  fi
+  if [ -n "$(git status --porcelain --untracked-files=normal | head -1)" ]; then
+    DIE_CODE=4; die "工作区有未提交的改动。审查绑定已提交的内容，请先提交（或 stash）再审。"
+  fi
+  st_read
+  exhausted_check
+  if [ -n "$LAST_TREE" ] && [ "$LAST_TREE" = "$TREE" ]; then
+    DIE_CODE=4; die "这份内容刚被拦过、之后没有新改动，重审只会重复花钱。先修阻断项并提交。"
+  fi
+  ROUND=$((ROUNDS_USED + 1))
+  if [ "$ROUND" -gt 1 ] && [ ! -f "$LAST_FILE" ]; then
+    DIE_CODE=4; die "状态不完整：现在是第 $ROUND 轮，却找不到上一轮的阻断项记录（$LAST_FILE）。没法核对遗留阻断项，为防止放过它们先停下。codex-review status 看状态；确认要重来就删掉 $STATE_FILE。"
+  fi
+  MODEL=${OPT_MODEL:-$CODEX_REVIEW_MODEL}
+  HITS=$(sensitive_hits)
+  if [ -n "$OPT_EFFORT" ]; then EFFORT=$OPT_EFFORT; EFFORT_WHY="手动指定"
+  elif [ "$DEEP_FLAG" = yes ] || { [ "$DEEP_FLAG" = auto ] && [ -n "$HITS" ]; }; then EFFORT=$CODEX_REVIEW_EFFORT_DEEP; EFFORT_WHY="命中敏感路径"
+  else EFFORT=$CODEX_REVIEW_EFFORT; EFFORT_WHY="常规"; fi
+}
+
+build_prompt() {
+  shopt -u patsub_replacement 2>/dev/null
+  local prev_txt="" tpl diff files f mark intent
+  {
+    cat "$ORCH_HOME/prompts/codex-review.md"
+    if [ "$ROUND" -gt 1 ] && [ -f "$LAST_FILE" ]; then
+      prev_txt=$(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));for(const b of j.blocking||[])console.log("- "+b.id+" ["+b.class+"] "+b.file+":"+b.line+" "+b.title+"\n  怎么发生："+b.how_it_happens)' "$(to_native "$LAST_FILE")" 2>/dev/null)
+      tpl=$(cat "$ORCH_HOME/prompts/codex-review-reround.md")
+      tpl=${tpl//\{\{ROUND\}\}/$ROUND}; tpl=${tpl//\{\{MAX\}\}/$MAX_ALLOWED}; tpl=${tpl//\{\{PREV\}\}/${prev_txt:-（无记录）}}
+      printf '\n%s\n' "$tpl"
+    fi
+    printf '\n## 本次审查范围\n- 基线：%s（合并基点 %s）\n- HEAD：%s\n- 轮次：第 %s 轮（上限 %s）\n- 改动文件（* = 命中敏感路径，请更仔细）：\n' "$BASE" "$MB" "$HEAD_SHA" "$ROUND" "$MAX_ALLOWED"
+    files=$(changed_files)
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      mark=" "; printf '%s\n' "$HITS" | grep -qxF -- "$f" && mark="*"
+      printf '  %s %s\n' "$mark" "$f"
+    done <<<"$files"
+    if [ -n "$INTENT" ]; then intent=$INTENT; else intent=$(git log --format='- %s' "$MB..$HEAD_SHA" | head -40); fi
+    printf '\n## 这次改动要做什么（意图）\n%s\n' "$intent"
+    printf '\n## 改动统计\n```\n%s\n```\n' "$(git diff --stat "$MB" "$HEAD_SHA" 2>/dev/null | tail -60)"
+    diff=$(git diff -U5 "$MB" "$HEAD_SHA" 2>/dev/null)
+    if [ ${#diff} -le "$REVIEW_DIFF_CAP_CHARS" ]; then
+      printf '\n## 完整 diff（-U5）\n```diff\n%s\n```\n' "$diff"
+    else
+      printf '\n## diff 过大（%s 字符，超过内嵌上限 %s）\n未内嵌。请用 `git diff -U5 %s %s -- <文件>` 按文件读（只读），敏感路径文件优先。\n' "${#diff}" "$REVIEW_DIFF_CAP_CHARS" "$MB" "$HEAD_SHA"
+    fi
+  } | redact code
+}
+
+# 处理一份原始审查结论：判定 → 记账 → 退出码。参数：原始结论文件
+finish_verdict() {
+  local raw=$1 out result
+  local prev_args=()
+  [ -n "${RUN:-}" ] || RUN=$(mk_run_dir review)
+  need_cmd node "Codex 本身依赖 Node"
+  if [ "$ROUND" -gt 1 ]; then
+    [ -f "$LAST_FILE" ] || { DIE_CODE=4; die "状态不完整：缺少上一轮阻断项记录（$LAST_FILE）"; }
+    prev_args=(--prev "$(to_native "$LAST_FILE")")
+  fi
+  out=$(node "$(to_native "$ORCH_LIB_DIR/verdict.mjs")" --in "$(to_native "$raw")" --out-json "$(to_native "$RUN/verdict.json")" \
+        --out-md "$(to_native "$RUN/report.md")" --round "$ROUND" --max "$MAX_ALLOWED" --model "$MODEL" --effort "$EFFORT" \
+        --base "$MB" --head "$HEAD_SHA" --min-path "$REVIEW_MIN_PATH_CHARS" "${prev_args[@]}")
+  result=$(printf '%s\n' "$out" | head -1 | sed 's/^RESULT=//')
+  printf '%s\n' "$out" | tail -n +2
+  echo "（运行记录：$RUN）"
+  case "$result" in
+    PASS)
+      printf 'status=pass\nround=%s\nmodel=%s\neffort=%s\ntree=%s\nbase=%s\n' "$ROUND" "$MODEL" "$EFFORT" "$TREE" "$MB" > "$OK_FILE"
+      attest_write pass
+      st_reset
+      echo "✓ 审查通过，已记录。可以推送。（要让 CI 也能核验：bash .orchestra/bin/codex-review publish）"
+      exit 0 ;;
+    BLOCK)
+      st_write "$ROUND" "$EXTRA" "$TREE"
+      cp "$RUN/verdict.json" "$LAST_FILE"; cp "$RUN/report.md" "${LAST_FILE%.json}.md"
+      rm -f "$PENDING_FILE"
+      if [ "$ROUND" -ge "$MAX_ALLOWED" ]; then
+        ROUNDS_USED=$ROUND
+        escalate_msg
+        notify_human "【需要你决定】分支 $BRANCH 审满 $ROUND 轮仍有阻断项。放行 / 再审一轮？详情见运行记录。"
+        exit 2
+      fi
+      echo "⛔ 有阻断项。修好 → 提交 → 再跑 bash .orchestra/bin/codex-review run（第 $((ROUND + 1)) 轮，上限 $MAX_ALLOWED）。建议项不用管，只记录。"
+      exit 1 ;;
+    *)
+      echo "审查结论无效（不计轮次）：请让审查者按 schema 重出，再 record / 或重跑 run。"
+      exit 3 ;;
+  esac
+}
+
+case "$SUB" in
+  status)
+    review_ctx_init; st_read
+    echo "分支 $BRANCH · 基线 $BASE · 树 ${TREE:0:10} · 已审 $ROUNDS_USED/$MAX_ALLOWED 轮"
+    if [ -f "$OK_FILE" ]; then echo "✓ 已通过/放行："; sed 's/^/  /' "$OK_FILE"; fi
+    if [ -f "$STATE_DIR/audit.log" ] && grep -qF "branch=$BRANCH " "$STATE_DIR/audit.log"; then
+      echo "--- 审计（本分支最近 5 条）---"; grep -F "branch=$BRANCH " "$STATE_DIR/audit.log" | tail -5 | sed 's/^/  /'
+    fi
+    [ -f "$OK_FILE" ] && exit 0
+    echo "✗ 这份改动还没有通过审查。"
+    [ -f "${LAST_FILE%.json}.md" ] && { echo "--- 最近一轮 ---"; cat "${LAST_FILE%.json}.md"; }
+    exit 1 ;;
+
+  approve|again)
+    [ -n "$(printf '%s' "$BY" | tr -d '[:space:]')" ] || { DIE_CODE=2; die "$SUB 必须带 --by \"<决定人与原话>\"——这是用户的决定，不是你的"; }
+    BY=$(printf '%s' "$BY" | tr '\r\n' '  ')
+    review_ctx_init; st_read
+    if [ "$SUB" = approve ]; then
+      nblk=0; [ -f "$LAST_FILE" ] && nblk=$(node -e 'console.log((JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).blocking||[]).length)' "$(to_native "$LAST_FILE")" 2>/dev/null || echo 0)
+      # 用户原话只留在本机（OK 记录 + audit.log）；发布出去的凭证里只放这个随机的审计引用——凭证会被推到远端、被 CI 打印
+      REF_ID="ap-$$-$RANDOM"
+      printf 'status=approved\nref=%s\nby=%s\nrounds_used=%s\nunresolved_blockers=%s\ntree=%s\nbase=%s\n' "$REF_ID" "$BY" "$ROUNDS_USED" "$nblk" "$TREE" "$MB" > "$OK_FILE"
+      audit "action=approve branch=$BRANCH key=$KEY unresolved=$nblk ref=$REF_ID by=$BY"
+      attest_write approved "$REF_ID"
+      st_reset
+      echo "✓ 已记录用户放行（带 $nblk 条未解决的阻断项）。审计：$OK_FILE 与 $STATE_DIR/audit.log（审计引用 $REF_ID）"
+    else
+      st_write "$ROUNDS_USED" "$((EXTRA + 1))" "$LAST_TREE"
+      audit "action=again branch=$BRANCH key=$KEY extra=$EXTRA->$((EXTRA + 1)) by=$BY"
+      echo "✓ 已给本分支加 1 轮额度（现上限 $((MAX_ALLOWED + 1)) 轮）。授权原话已写入审计：$STATE_DIR/audit.log"
+    fi
+    exit 0 ;;
+
+  publish)
+    review_ctx_init
+    attest_publish; prc=$?
+    if [ "$prc" -eq 3 ]; then echo "没有任何审查凭证可发布：本机还没有通过/放行的记录。先 codex-review run（或由用户放行），再 publish。" >&2; exit 1; fi
+    if [ "$prc" -eq 0 ]; then echo "✓ 审查凭证已发布到 ${ORCH_REMOTE:-origin}（refs/notes/$ATTEST_REF）。CI 里：ORCH_BASE=origin/<目标分支> bash <目标分支上的可信副本>/.orchestra/bin/review-gate-check --ci（见 docs/CI接入.md）"; exit 0
+    else echo "发布失败：推不上去，也没能合并远端的凭证。检查远端权限/网络；这不影响本机的审查结论。" >&2; exit 5; fi ;;
+
+  prompt)
+    prepare
+    PROMPT_TXT=$(build_prompt) || exit 1
+    REQ_ID="rq-$$-$RANDOM"
+    pending_write
+    echo "# 轮次 $ROUND/$MAX_ALLOWED · 模型 $MODEL · 推理 $EFFORT（$EFFORT_WHY）· 敏感命中 $(printf '%s' "$HITS" | grep -c . || true) 个文件" >&2
+    echo "# 请求ID: $REQ_ID" >&2
+    echo "# 已记下审查请求（树 ${TREE:0:10}）：record 时必须带 --request $REQ_ID，且内容不能变" >&2
+    echo "# T3 路径：delegate_task(role=review, target=codex/$MODEL, options={reasoningEffort:$EFFORT}, isolation=worktree)；结论 JSON 存文件后用 record 喂回来" >&2
+    printf '%s\n' "$PROMPT_TXT"
+    exit 0 ;;
+
+  record)
+    [ -n "$RECORD_FILE" ] && [ -f "$RECORD_FILE" ] || { DIE_CODE=2; die "record 需要原始审查结论文件：codex-review record <文件> --request <请求ID>"; }
+    [ -n "$REQ" ] || { DIE_CODE=2; die "record 需要 --request <请求ID>（prompt 的 stderr 里 “# 请求ID:” 那一行）"; }
+    # 先验请求ID，再做别的：内容已通过之后，迟到的旧请求也要被拒（退出 4），而不是被「已有通过记录」悄悄吞成退出 0；
+    # 但「已审满、该交用户决定」比「没有对应请求」更有用，所以审满检查排在请求ID 之前。
+    review_ctx_init; st_read
+    exhausted_check
+    pending_load || { DIE_CODE=4; die "没有对应的审查请求（没跑过 prompt，或这个请求已经用掉/作废了）。先跑 codex-review prompt，把它的输出交给审查者，再 record 它交回的结论。"; }
+    if [ "$P_REQ" != "$REQ" ]; then
+      DIE_CODE=4; die "请求ID 对不上（给的是 $REQ，当前有效的是 $P_REQ）——这多半是迟到的旧结论；不能记到新请求头上。"
+    fi
+    prepare
+    if [ "$P_TREE" != "$TREE" ] || [ "$P_MB" != "$MB" ]; then
+      DIE_CODE=4; die "自从生成提示词之后，内容变了（树或基点不同）——这份结论审的不是当前这份改动，不能记到它头上。重新跑 prompt。"
+    fi
+    if [ "$P_ROUND" != "$ROUND" ]; then
+      DIE_CODE=4; die "轮次对不上（请求是第 $P_ROUND 轮，现在该第 $ROUND 轮）。重新跑 prompt。"
+    fi
+    MODEL=${P_MODEL:-$MODEL}; EFFORT=${P_EFFORT:-$EFFORT}
+    finish_verdict "$RECORD_FILE" ;;
+
+  run)
+    need_cmd codex "装 Codex CLI（npm i -g @openai/codex）"
+    prepare
+    RUN=$(mk_run_dir review)
+    build_prompt > "$RUN/prompt.md"
+    echo "审查第 $ROUND/$MAX_ALLOWED 轮 · $MODEL · 推理 $EFFORT（$EFFORT_WHY）· 基线 $BASE" >&2
+    ARGS=(-m "$MODEL" -c "model_reasoning_effort=\"$EFFORT\"" -c 'sandbox_mode="read-only"' -c 'approval_policy="never"'
+          --color never --json --output-schema "$(to_native "$ORCH_HOME/prompts/review.schema.json")"
+          -o "$(to_native "$RUN/reply.json")" -C "$(to_native "$TOP")")
+    run_scrubbed "$RUN/prompt.md" "$RUN/events.jsonl" "$RUN/stderr.log" 1 -- timeout "$REVIEW_TIMEOUT_SECS" codex exec "${ARGS[@]}" -
+    RC=$?
+    if [ $RC -ne 0 ] || [ ! -s "$RUN/reply.json" ]; then
+      echo "codex-review：审查者不可用或失败（退出码 $RC）。stderr 末尾：" >&2; tail -8 "$RUN/stderr.log" >&2
+      echo "不计轮次。不要悄悄换别的模型顶替——向用户说明。运行记录：$RUN" >&2
+      exit 5
+    fi
+    finish_verdict "$RUN/reply.json" ;;
+esac

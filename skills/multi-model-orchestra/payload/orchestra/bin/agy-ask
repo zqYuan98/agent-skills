@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# agy-ask —— 总指挥以「只读顾问」的方式调用 Gemini（Antigravity CLI：agy）。
+#
+# 对应文章里那个 90 行的小脚本：定死用什么模型、禁止动文件只能查、回答的规范预设好，方便 Claude 直接调。
+# 只读靠三层：① agy --mode plan  ② agy --sandbox  ③ 与 CLI 无关的事后指纹校验（改了文件就非零退出）。
+set -uo pipefail
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+# shellcheck source=/dev/null
+. "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+用法：
+  agy-ask [选项] <目录> "<任务>"     任务写 - 表示从标准输入读（长 brief 用 heredoc 喂进来，避免引号转义）
+  agy-ask --copy [选项] <目录> "<任务>"   文案/交互顾问模式（回答规范不同）
+  agy-ask --doctor                   体检：agy 在不在、版本、配置的模型名是否在 `agy models` 里（不调用模型）
+  agy-ask --smoke                    真实小测：能回话吗？只读真的守住了吗？（会调用 Gemini 两次，内容无害）
+选项：
+  --model <id>   --effort <low|medium|high|xhigh|max>
+  --print-prompt 只打印最终提示词（预设规范 + 脱敏后的任务），不调用；T3 delegate_task 路径用它
+退出码：0 成功 | 2 用法错 | 3 只读被破坏 | 4 前置条件不满足 | 5 顾问不可用或失败
+  5 的含义：不要悄悄换别的模型顶替——向用户说明，让用户选「跳过 / Codex 出第二份 / Claude 新上下文子代理」。
+提醒：给它的任务只放用户原话和必要背景，不放你自己的草稿和倾向（独立性靠这个）。
+EOF
+}
+
+find_agy() {
+  if [ -n "${AGY_BIN:-}" ]; then printf '%s' "$AGY_BIN"; return 0; fi
+  command -v agy 2>/dev/null && return 0
+  local c
+  for c in "$HOME/.gemini/bin/agy.exe" "$HOME/.gemini/bin/agy"; do
+    [ -f "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
+# 现场自检：事后只读校验靠 tree_fingerprint；它依赖 GNU 的 find/xargs/stat/sed，缺了会【静默】失效。
+# 所以建个带被忽略文件的临时仓库，分别「改被忽略文件」「提交一个新文件」，每次指纹都必须变。
+fp_selftest() {
+  local t a b c ok=1
+  t=$(mktemp -d) || return 1
+  ( cd "$t" && git init -q . && printf '.env\n' > .gitignore && printf 'K=1\n' > .env && git add .gitignore \
+    && git -c user.email=t@example.invalid -c user.name=t commit -qm i ) >/dev/null 2>&1 || ok=0
+  a=$(tree_fingerprint "$t")
+  ( cd "$t" && printf 'K=2\n' > .env )
+  b=$(tree_fingerprint "$t")
+  ( cd "$t" && printf 'x\n' > f.txt && git add f.txt && git -c user.email=t@example.invalid -c user.name=t commit -qm 2 ) >/dev/null 2>&1 || ok=0
+  c=$(tree_fingerprint "$t")
+  rm -rf "$t"
+  [ "$ok" = 1 ] && [ -n "$a" ] && [ "$a" != "$b" ] && [ "$b" != "$c" ]
+}
+
+doctor() {
+  local agy ver models rc=0
+  if fp_selftest; then echo "✓ 只读指纹自检通过（含被 .gitignore 忽略的文件）"
+  else echo "✗ 只读指纹自检失败：本机的 git/find/xargs/stat/sed 可能不是 GNU 版本，事后只读校验会形同虚设"; rc=4; fi
+  if agy=$(find_agy); then echo "✓ agy：$agy"; else echo "✗ 找不到 agy（装 Antigravity CLI，或设 AGY_BIN=<路径>）"; return 4; fi
+  ver=$("$agy" --version 2>&1 | head -1); echo "  版本：$ver"
+  echo "  配置：模型=$GEMINI_MODEL 推理=$GEMINI_EFFORT 模式=$AGY_MODE（改法见 .orchestra/orchestra.conf）"
+  models=$("$agy" models 2>&1)
+  if printf '%s\n' "$models" | awk '{print $1}' | grep -qxF -- "$GEMINI_MODEL"; then
+    echo "✓ 模型 $GEMINI_MODEL 在 agy models 里"
+  elif printf '%s\n' "$models" | awk '{print $1}' | grep -qxF -- "$GEMINI_MODEL-$GEMINI_EFFORT"; then
+    echo "✓ 找到 ${GEMINI_MODEL}-${GEMINI_EFFORT}：agy 的模型 id 带推理档后缀，建议把 GEMINI_MODEL 改成它"
+  else
+    echo "✗ agy models 里没有 $GEMINI_MODEL。你账号能用的有："
+    printf '%s\n' "$models" | head -15 | sed 's/^/    /'
+    rc=4
+  fi
+  echo "  下一步：bash .orchestra/bin/agy-ask --smoke  （真实验证能回话、且只读守得住）"
+  return $rc
+}
+
+smoke() {
+  local t out rc fail=0
+  t=${ORCH_SMOKE_DIR:-$(mktemp -d)}; mkdir -p "$t"
+  printf '# probe\nfirst line is: ALPHA-7\n' > "$t/hello.md"
+  echo "[smoke] 目录：$t"
+  echo "[1/2] 回话 + 读文件……"
+  out=$("$SELF" "$t" "Read hello.md in this directory and quote its second line verbatim. Reply with that line only." 2>&1); rc=$?
+  if [ $rc -eq 0 ] && printf '%s' "$out" | grep -q 'ALPHA-7'; then echo "  ✓ 通过（读到了 ALPHA-7）"
+  else echo "  ✗ 失败（退出码 $rc）："; printf '%s\n' "$out" | tail -6 | sed 's/^/    /'; fail=1; fi
+  if [ $fail -ne 0 ]; then
+    # 顾问都没跑通，再测「只读」只会得到一个空洞的通过：调用失败了，当然「没写出文件」——那说明不了只读守住了。
+    echo "[2/2] 跳过：顾问还没跑通，现在测只读没有意义（一个失败的调用不能算「只读守住了」）。先解决上一步，再重跑 --smoke。"
+    return 1
+  fi
+  echo "[2/2] 只读：要求它写文件，文件不该出现……"
+  "$SELF" "$t" "Create a file named probe.txt in the current directory containing the word hello, then reply DONE." >/dev/null 2>&1; rc=$?
+  if [ -e "$t/probe.txt" ] || [ $rc -eq 3 ]; then echo "  ✗ 只读被破坏！别用这个档位（AGY_MODE=$AGY_MODE）当只读顾问"; fail=1
+  elif [ $rc -ne 0 ]; then echo "  ? 无法判断：这次调用本身失败了（退出码 $rc），「没写出文件」说明不了只读守住了。重跑 --smoke。"; fail=1
+  else echo "  ✓ 通过（它没写出文件，调用本身成功）"; fi
+  return $fail
+}
+
+MODE=plan; PRINT=0; DO_DOCTOR=0; DO_SMOKE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --copy) MODE=copy; shift ;;
+    --model) GEMINI_MODEL=${2:?--model 需要值}; shift 2 ;;
+    --effort) GEMINI_EFFORT=${2:?--effort 需要值}; shift 2 ;;
+    --print-prompt) PRINT=1; shift ;;
+    --doctor) DO_DOCTOR=1; shift ;;
+    --smoke) DO_SMOKE=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) echo "未知参数：$1" >&2; usage >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+
+[ "$DO_DOCTOR" -eq 1 ] && { doctor; exit $?; }
+[ "$DO_SMOKE" -eq 1 ] && { smoke; exit $?; }
+
+[ $# -ge 2 ] || { usage >&2; exit 2; }
+DIR=$1; TASK=$2
+[ -d "$DIR" ] || { DIE_CODE=4; die "目录不存在：$DIR"; }
+[ "$TASK" = "-" ] && TASK=$(cat)
+[ -n "$TASK" ] || { DIE_CODE=2; die "任务为空"; }
+
+PREAMBLE="$ORCH_HOME/prompts/gemini-$MODE.md"
+[ -f "$PREAMBLE" ] || { DIE_CODE=4; die "缺少预设规范：$PREAMBLE"; }
+
+FULL=$(printf '%s\n\n---\n\n## 任务\n\n%s\n' "$(cat "$PREAMBLE")" "$TASK")
+PROMPT=$(printf '%s' "$FULL" | redact)
+if [ "$PROMPT" != "$FULL" ]; then warn "任务里含个人信息/密钥/本机路径，已自动脱敏（规则见 lib/common.sh）"; fi
+
+if [ "$PRINT" -eq 1 ]; then printf '%s\n' "$PROMPT"; exit 0; fi
+
+AGY=$(find_agy) || { DIE_CODE=4; die "找不到 agy。装好 Antigravity CLI，或设 AGY_BIN=<路径>；可先跑 --doctor"; }
+[ ${#PROMPT} -le 24000 ] || { DIE_CODE=4; die "提示词 ${#PROMPT} 字符，超过命令行安全上限 24000。精简 brief；长材料写成文件放进目录里让它自己读。"; }
+
+RUN=$(mk_run_dir agy)
+printf '%s\n' "$PROMPT" > "$RUN/prompt.md"
+FP0=$(tree_fingerprint "$DIR")
+
+agy_call() {
+  # shellcheck disable=SC2086
+  ( cd "$DIR" && timeout "$AGY_TIMEOUT_SECS" "$AGY" --model "$GEMINI_MODEL" --effort "$GEMINI_EFFORT" \
+      --mode "$AGY_MODE" --sandbox ${AGY_EXTRA_ARGS:-} -p "$PROMPT" )
+}
+# answer.md 是模型回答，原样保存；stderr 日志流式擦掉时间戳再落盘（不留原始版本）
+run_scrubbed /dev/null "$RUN/answer.md" "$RUN/stderr.log" 0 -- agy_call
+RC=$?
+
+FP1=$(tree_fingerprint "$DIR")
+if [ "$FP0" != "$FP1" ]; then
+  echo "agy-ask：⚠ 只读被破坏——运行期间 $DIR 下的文件变了。先 git status / git diff 看它改了什么，再决定是否还原。" >&2
+  ( cd "$DIR" && git status --short 2>/dev/null | head -20 ) >&2
+  echo "运行记录：$RUN" >&2
+  exit 3
+fi
+if [ $RC -ne 0 ] || [ ! -s "$RUN/answer.md" ]; then
+  echo "agy-ask：顾问不可用或失败（agy 退出码 $RC${RC:+，}${RC:+或回答为空}）。stderr 末尾：" >&2
+  tail -5 "$RUN/stderr.log" >&2
+  echo "→ 按规则：不要悄悄换别的模型顶替。向用户说明，让用户选：跳过 / Codex 出第二份 / Claude 新上下文子代理。" >&2
+  echo "运行记录：$RUN" >&2
+  exit 5
+fi
+printf '<!-- agy-ask 运行记录：%s -->\n' "$RUN"
+cat "$RUN/answer.md"

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# 审查门（git pre-push 的实现）。由 .git/hooks/pre-push 的转发桩调用（install.sh --git-hook 装的）；
+# 门逻辑就在这个文件里，随套件更新、不用动 .git/hooks。绕过只能用户本人：git push --no-verify
+# 逐个被推送的「分支更新」检查：该提交的内容有没有通过审查（或被用户放行）。
+#
+# 钩子的 stdin 每行：<本地ref> <本地sha> <远端ref> <远端sha>。
+# 按【远端 ref】判断是不是分支更新——用「提交号:refs/heads/x」或「HEAD:refs/heads/x」推送时，
+# 本地 ref 不是 refs/heads/*，按本地 ref 判断会被绕过。
+#
+# 门脚本按【本文件自己所在的位置】找（../bin/review-gate-check），不按 git 的工作树根找：
+# linked worktree 可能是从装套件之前的提交建的、自己那份检出里没有 .orchestra，转发桩会回退到主工作区的套件来调本文件。
+# 找不到门脚本就【拦住】，不放行——静默放行等于门悄悄没了。
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+gate="$here/../bin/review-gate-check"
+if [ ! -f "$gate" ]; then
+  echo "审查门 ⛔ 找不到 review-gate-check（$gate）。为不静默放行，推送已拦下。重装套件，或由用户本人 git push --no-verify。" >&2
+  exit 1
+fi
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  case "$remote_ref" in refs/heads/*) ;; *) continue ;; esac   # 只管分支更新，不管 tag 等
+  case "$local_sha" in *[!0]*) ;; *) continue ;; esac          # 全零（SHA-1 是 40 个、SHA-256 是 64 个）= 删除远端分支，不用审
+  bash "$gate" "$local_sha" "$remote_ref" || exit 1
+done
+exit 0

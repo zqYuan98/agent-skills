@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# notify-feishu —— 把一段文字发到飞书自定义机器人（webhook）。给 ORCH_NOTIFY_CMD 用：审查升级给用户时，摘要从 stdin 喂进来。
+#
+# 用法：
+#   export ORCH_FEISHU_WEBHOOK='https://open.feishu.cn/open-apis/bot/v2/hook/<token>'   # 这是密钥：别写进仓库、别进日志
+#   export ORCH_NOTIFY_CMD='bash .orchestra/bin/notify-feishu'
+#   printf '正文' | bash .orchestra/bin/notify-feishu [--dry-run] [标题]
+# 先发「卡片」；卡片被拒就自动退回纯文本。正文先过 redact（邮箱/IP/密钥/本机路径），超过 3000 字节按字符边界截断。
+# --dry-run 只打印要发的卡片，不联网。
+# 传输是固定的：不读 ~/.curlrc，不接受环境变量往 curl 里塞任意参数（--trace、-o 之类能把含 token 的 URL 写进文件）；
+# URL 不出现在命令行里（ps 看不到）。要绕过代理直连（比如连本机的测试服务），设 ORCH_NOTIFY_NOPROXY=1。
+# 成功 = HTTP 2xx，且返回 JSON 顶层的 code（老版本叫 StatusCode）为 0。
+# 限制：不支持开启了「签名校验」的机器人——签名要用当前时间戳，而本套件不取当前时间。要用就在飞书里把签名校验关掉，
+#       或改用「关键词」/「IP 白名单」。退出码：0 已发送 | 2 用法错/没设 webhook | 5 发送失败。
+set -uo pipefail
+# shellcheck source=/dev/null
+. "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
+
+DRY=0; TITLE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1; shift ;;
+    -h|--help) sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) TITLE=$1; shift ;;
+  esac
+done
+TITLE=${TITLE:-编排套件：需要你决定}
+TITLE=$(printf '%s' "$TITLE" | head -c 1000 | tr '\r\n' '  ' | redact)     # 标题和正文一样要脱敏；去掉换行
+BODY=$(cat)
+[ -n "$BODY" ] || { DIE_CODE=2; die "stdin 是空的：把要发的摘要从标准输入喂进来"; }
+BODY=$(printf '%s' "$BODY" | head -c 100000 | redact)    # 先卡个大上限再脱敏；真正的 3000 字节上限在 mk_payload 里按字符边界截
+need_cmd node "Codex 本身依赖 Node"
+
+mk_payload() { # mk_payload card|text → 载荷 JSON。截断在这里做：按 UTF-8 字节算上限，但绝不把一个字符切成两半
+  printf '%s' "$BODY" | MSYS2_ARG_CONV_EXCL='*' node -e '
+const kind = process.argv[1], title = process.argv[2];
+let body = require("fs").readFileSync(0, "utf8");
+const MAX = 3000;
+const buf = Buffer.from(body, "utf8");
+if (buf.length > MAX) {
+  let cut = MAX;
+  while (cut > 0 && (buf[cut] & 0xC0) === 0x80) cut--;          // 第 cut 个字节是字符中间：往回退到字符开头
+  body = buf.subarray(0, cut).toString("utf8") + "\n…（正文超长，已截断）";
+}
+const p = kind === "card"
+  ? { msg_type: "interactive", card: { header: { title: { tag: "plain_text", content: title }, template: "orange" }, elements: [{ tag: "div", text: { tag: "lark_md", content: body } }] } }
+  : { msg_type: "text", content: { text: title + "\n" + body } };
+process.stdout.write(JSON.stringify(p));' "$1" "$TITLE"
+}
+
+if [ "$DRY" -eq 1 ]; then
+  echo "（dry-run：不联网；webhook 已隐藏）"; mk_payload card; echo; exit 0
+fi
+
+[ -n "${ORCH_FEISHU_WEBHOOK:-}" ] || { DIE_CODE=2; die "没设 ORCH_FEISHU_WEBHOOK（飞书自定义机器人的 webhook 地址）"; }
+# 只认 http(s)；引号、反斜杠、换行会破坏下面的 curl 配置行（也是注入的口子）。报错里不回显 webhook。
+case "$ORCH_FEISHU_WEBHOOK" in http://*|https://*) ;; *) DIE_CODE=2; die "ORCH_FEISHU_WEBHOOK 必须是 http:// 或 https:// 开头的地址" ;; esac
+case "$ORCH_FEISHU_WEBHOOK" in *[\"\\]*|*$'\n'*|*$'\r'*) DIE_CODE=2; die "ORCH_FEISHU_WEBHOOK 里有不能出现的字符（引号、反斜杠或换行）" ;; esac
+need_cmd curl "装 curl"
+
+NOPROXY=(); [ "${ORCH_NOTIFY_NOPROXY:-}" = 1 ] && NOPROXY=(--noproxy '*')
+PF=$(mktemp) || { DIE_CODE=5; die "建不了临时文件"; }
+trap 'rm -f "$PF"' EXIT
+
+# 发一次。URL 经 -K - 从 stdin 交给 curl，不进命令行；-q 必须是第一个参数（不读 ~/.curlrc）；
+# 载荷走临时文件（stdin 已经被配置占用）；任何报错都不回显 URL，stderr 丢弃。
+send() {
+  local out rc code body
+  mk_payload "$1" > "$PF"
+  out=$(printf 'url = "%s"\n' "$ORCH_FEISHU_WEBHOOK" | curl -q -sS --globoff --max-time 15 --proto '=http,https' --proto-redir '=http,https' \
+        ${NOPROXY[@]+"${NOPROXY[@]}"} -K - -H 'Content-Type: application/json' --data-binary "@$(to_native "$PF")" -w '\n%{http_code}' 2>/dev/null)
+  rc=$?
+  [ $rc -eq 0 ] || return 1
+  code=${out##*$'\n'}; body=${out%$'\n'*}
+  case "$code" in 2[0-9][0-9]) ;; *) return 1 ;; esac
+  printf '%s' "$body" | MSYS2_ARG_CONV_EXCL='*' node -e '
+let j; try { j = JSON.parse(require("fs").readFileSync(0, "utf8")); } catch (e) { process.exit(1); }
+const c = j && typeof j === "object" ? (j.code !== undefined ? j.code : j.StatusCode) : undefined;   // 只认顶层，嵌套里的 code 不算
+process.exit(c === 0 ? 0 : 1);'
+}
+
+if send card; then echo "✓ 已发到飞书（卡片）"; exit 0; fi
+warn "飞书没接受卡片（或连不上），退回纯文本再试一次"
+if send text; then echo "✓ 已发到飞书（纯文本）"; exit 0; fi
+echo "发送失败：连不上飞书，或 webhook 不对/机器人开了签名校验。（不回显 webhook）" >&2
+exit 5

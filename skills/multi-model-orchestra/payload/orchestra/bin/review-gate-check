@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# review-gate-check —— 审查门校验：这份改动有没有通过审查、或被用户放行？
+# 给 git pre-push 钩子和 CI 用。退出码 0 = 放行；1 = 拦住。
+# 用法：review-gate-check [<提交> [<目标分支|refs/heads/目标分支>]]     （本机：默认 HEAD、当前分支；读 .git/orchestra/ 里的记录）
+#       review-gate-check --ci [<提交>]                                   （CI：读 git notes 里的审查凭证；必须显式给基线）
+# 关闭门（只应由用户本人这样做）：ORCH_GATE=off
+#
+# fail-closed：认不出基线分支时【拦住】并告诉怎么配，而不是放行——
+# 否则默认分支叫 trunk/release 之类、又没设 origin/HEAD 的仓库，门就悄悄形同虚设了。
+# 基线是猜的、且被推送的提交相对它「没有任何改动」时同样拦住：那个「没有改动」不可信。
+#
+# --ci：本机的审查记录在 .git/orchestra/，CI 看不见。CI 里改读审查凭证（git notes，refs/notes/orchestra-review，
+#   由 codex-review publish 发布）：按「树＋基线」找 status 为 pass/approved 的那一段。CI 里不猜基线——
+#   必须设 ORCH_BASE=origin/<目标分支>，而且必须是远端跟踪分支（HEAD、提交号、本地分支、标签一律拒绝）。
+#   取不到远端的凭证 = 失败（不用旧副本）。退出码：0 有凭证（或相对基线没有改动）| 1 拦住（含配置不对）| 4 环境不满足（比如浅克隆）。
+#   【脚本必须取自目标分支的可信副本，不能直接跑 PR 里的那份】——PR 能把它改成「永远放行」。做法见 docs/CI接入.md。
+#   凭证是流程证据而不是防篡改证明：有该 ref 推送权限的人能伪造，要更强请保护这个 ref。
+set -uo pipefail
+# shellcheck source=/dev/null
+. "$(dirname "${BASH_SOURCE[0]}")/../lib/review.sh"
+
+CI=0; [ "${1:-}" = "--ci" ] && { CI=1; shift; }
+
+# ORCH_GATE=off 是用户在【本机】的豁免；CI 核验不认它（CI 环境里继承到这个变量，不该能关掉核验）
+if [ "$CI" -eq 0 ] && [ "${ORCH_GATE:-on}" = "off" ]; then warn "审查门被 ORCH_GATE=off 关闭（只应由用户本人这样做）"; exit 0; fi
+[ "$CI" -eq 1 ] && [ "${ORCH_GATE:-on}" = "off" ] && warn "CI 核验不认 ORCH_GATE=off（那是本机的豁免）"
+
+git rev-parse --show-toplevel >/dev/null 2>&1 || { [ "$CI" -eq 1 ] && { echo "审查门(CI) ⛔ 不在 git 仓库里" >&2; exit 1; }; exit 0; }
+
+if [ "$CI" -eq 1 ]; then
+  [ -n "${ORCH_BASE:-}" ] || { echo "审查门(CI) ⛔ CI 里不猜基线：请显式设置 ORCH_BASE=origin/<目标分支>" >&2; exit 1; }
+  # 基线必须是【远端跟踪分支】（refs/remotes/…）：HEAD、提交号、本地分支、标签都不行——
+  # 它们要么能被候选内容影响、要么能让「相对基线没有任何改动」变成假的，那样任何未审内容都会被放过。
+  # 先补全成 refs/remotes/<…> 再用：git 解析 origin/main 时，同名标签会排在远端跟踪分支前面。
+  case "$ORCH_BASE" in
+    refs/remotes/*) CI_BASE=$ORCH_BASE ;;
+    refs/*|HEAD|FETCH_HEAD|ORIG_HEAD|MERGE_HEAD) CI_BASE="" ;;
+    *) CI_BASE="refs/remotes/$ORCH_BASE" ;;
+  esac
+  # show-ref --verify 只认「恰好存在的 ref 名」：不接受 origin/main~1、origin/main^{tree} 这类修订表达式，也不接受缩写
+  if [ -z "$CI_BASE" ] || ! git show-ref --verify -q "$CI_BASE" 2>/dev/null; then
+    {
+      echo "审查门(CI) ⛔ ORCH_BASE=${ORCH_BASE} 不是可用的基线：必须是【远端跟踪分支】，写成 origin/<目标分支>，并确认 CI 已经取到它。"
+      echo "  HEAD、提交号、本地分支、标签都不行——它们能让「相对基线没有任何改动」变成假的，任何未审内容都会被放过。"
+      echo "  取不到时先：git fetch origin +refs/heads/<目标分支>:refs/remotes/origin/<目标分支>"
+    } >&2
+    exit 1
+  fi
+  BASE_OVERRIDE=$CI_BASE
+  review_ctx_init "${1:-HEAD}"
+  if [ "$MB" = "$HEAD_SHA" ]; then echo "审查门(CI) ✓ 这个提交已经在 ${BASE#refs/remotes/} 的历史里，相对它没有任何改动"; exit 0; fi
+  # 远端的凭证取到【本次调用独有的】临时 ref，用完就删：
+  #   · 不用「+远端:本地同名」去覆盖——在本机自测 --ci 时，会把还没发布的本地凭证冲掉；
+  #   · 不留上次的副本——否则这次取失败了（远端的凭证被删/回滚、连不上），会拿着旧副本悄悄核验通过；
+  #   · _ag：身份日期固定、不建 reflog；--no-write-fetch-head：FETCH_HEAD 里也不留痕迹。
+  CI_REF="refs/notes/$ATTEST_REF-ci-$$"
+  trap '_ag update-ref -d "$CI_REF" >/dev/null 2>&1' EXIT
+  if ! _ag fetch -q --no-write-fetch-head --refmap= --no-tags -- "${ORCH_REMOTE:-origin}" "+refs/notes/$ATTEST_REF:$CI_REF" 2>/dev/null; then
+    {
+      echo "审查门(CI) ⛔ 取不到远端（${ORCH_REMOTE:-origin}）的审查凭证：远端没有 refs/notes/$ATTEST_REF（还没 publish？），或者连不上。"
+      echo "  在本机：bash .orchestra/bin/codex-review publish，再重跑 CI。（需要 git ≥ 2.29）"
+    } >&2
+    exit 1
+  fi
+  if blk=$(attest_find "$TREE" "$KEY" "$CI_REF"); then
+    echo "审查门(CI) ✓ 这份内容（树 ${TREE:0:10}，基线 ${BASE#refs/remotes/}）有审查凭证："
+    printf '%s\n' "$blk" | grep -E '^(orchestra-review v1|key=[0-9a-f]+-[0-9a-f]+|status=(pass|approved)|round=[0-9]+|model=[A-Za-z0-9._/@+-]*|effort=[A-Za-z0-9._-]*|by_ref=[A-Za-z0-9._-]+)$' | sed 's/^/  /'
+    exit 0
+  fi
+  {
+    echo "审查门(CI) ⛔ 这份内容（树 ${TREE:0:10}，基线 ${BASE#refs/remotes/}）没有审查凭证。"
+    echo "  在本机：bash .orchestra/bin/codex-review run → 通过后 bash .orchestra/bin/codex-review publish，再重跑 CI。"
+    echo "  （内容在审查之后又改过，或审查时用的基线和这里不同，凭证都不算数。）"
+  } >&2
+  exit 1
+fi
+
+if ! resolve_base_quiet; then
+  {
+    echo "审查门 ⛔ 找不到基线分支，没法判断这次推送改了什么——保守起见拦住。"
+    echo "  $BASE_HELP"
+    echo "  （用户本人确认这次不需要审查：git push --no-verify，或 ORCH_GATE=off）"
+  } >&2
+  exit 1
+fi
+
+review_ctx_init "${1:-HEAD}" "${2:-}"
+if [ "$SELF_BASE" = 1 ]; then
+  {
+    echo "审查门 ⛔ 基线是猜出来的（$BASE），而这次推送（${REVIEW_BRANCH}）相对它【没有任何改动】——没法比较，也就没法确认「没有改动」是真的（比如默认分支其实叫别的名字）。保守起见拦住。"
+    echo "  $BASE_HELP"
+    echo "  （用户本人确认这次不需要审查：git push --no-verify，或 ORCH_GATE=off）"
+  } >&2
+  exit 1
+fi
+[ "$MB" = "$HEAD_SHA" ] && exit 0     # 没有相对基线的改动（例如推送的就是基线分支本身，且基线有明确依据）
+
+if [ -f "$OK_FILE" ]; then
+  echo "审查门 ✓ $(sed -n 's/^status=//p' "$OK_FILE" | head -1)（树 ${TREE:0:10}）"
+  exit 0
+fi
+
+st_read
+{
+  echo "审查门 ⛔ 这份改动（${HEAD_SHA:0:10}，基线 $BASE）还没有通过审查，不能推送。"
+  echo "  已审 $ROUNDS_USED/$MAX_ALLOWED 轮。运行：bash .orchestra/bin/codex-review run"
+  [ "$ROUNDS_USED" -ge "$MAX_ALLOWED" ] && echo "  已审满轮数 → 需要用户决定（放行 / 再审一轮），见 codex-review --help。"
+} >&2
+exit 1
